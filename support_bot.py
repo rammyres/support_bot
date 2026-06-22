@@ -13,6 +13,12 @@ WHAT THIS BOT DOES
   (outside of Telegram - by phone, email, website, etc).
 - The customer opens a private chat with the bot and sends:  /start CODE
 - The bot links the customer and that representative into a live session.
+- A representative can have SEVERAL customers connected at once. The bot
+  routes replies automatically: just reply (Telegram's native reply
+  feature) to a specific customer's message to answer them. If a rep has
+  only one active conversation, plain messages go straight through with no
+  reply needed. /chats lists active conversations; /switch <id> sets which
+  one plain (non-reply) messages go to by default.
 - While the session is active, ANY message either side sends (text, photo,
   video, voice note, audio file, document, video note, sticker) is relayed
   to the other side automatically.
@@ -120,6 +126,8 @@ DEFAULT_COMMANDS = [
 REP_COMMANDS = DEFAULT_COMMANDS + [
     BotCommand("name", "Change your display name"),
     BotCommand("newcode", "Generate a one-time customer code"),
+    BotCommand("chats", "List your active conversations"),
+    BotCommand("switch", "Switch your default reply target"),
 ]
 
 ADMIN_COMMANDS = REP_COMMANDS + [
@@ -170,6 +178,7 @@ def init_db():
                 name TEXT,
                 pending_name_setup INTEGER DEFAULT 1,
                 approved INTEGER DEFAULT 0,
+                current_focus_customer_id INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -190,6 +199,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS sessions (
                 customer_id INTEGER PRIMARY KEY,
                 rep_id INTEGER NOT NULL,
+                customer_name TEXT,
                 active INTEGER DEFAULT 1,
                 started_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (rep_id) REFERENCES representatives (telegram_id)
@@ -211,6 +221,33 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_map (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rep_id INTEGER NOT NULL,
+                rep_message_id INTEGER NOT NULL,
+                customer_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (rep_id, rep_message_id)
+            )
+            """
+        )
+
+        # --- migration for databases created before this feature existed ---
+        existing_session_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+        if "customer_name" not in existing_session_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN customer_name TEXT")
+
+        existing_rep_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(representatives)")
+        }
+        if "current_focus_customer_id" not in existing_rep_cols:
+            conn.execute(
+                "ALTER TABLE representatives ADD COLUMN current_focus_customer_id INTEGER"
+            )
 
 
 # --- representatives -------------------------------------------------------
@@ -290,14 +327,15 @@ def consume_code(code: str):
 
 # --- sessions ------------------------------------------------------------
 
-def start_session(customer_id: int, rep_id: int):
+def start_session(customer_id: int, rep_id: int, customer_name: str = None):
     with closing(db_connect()) as conn, conn:
         conn.execute(
-            "INSERT INTO sessions (customer_id, rep_id, active) "
-            "VALUES (?, ?, 1) "
+            "INSERT INTO sessions (customer_id, rep_id, customer_name, active) "
+            "VALUES (?, ?, ?, 1) "
             "ON CONFLICT(customer_id) DO UPDATE SET rep_id = excluded.rep_id, "
-            "active = 1, started_at = CURRENT_TIMESTAMP",
-            (customer_id, rep_id),
+            "customer_name = excluded.customer_name, active = 1, "
+            "started_at = CURRENT_TIMESTAMP",
+            (customer_id, rep_id, customer_name),
         )
 
 
@@ -305,6 +343,13 @@ def end_session_for_customer(customer_id: int):
     with closing(db_connect()) as conn, conn:
         conn.execute(
             "UPDATE sessions SET active = 0 WHERE customer_id = ?", (customer_id,)
+        )
+        # Clear focus on any rep who had this customer focused - it's no
+        # longer a valid reply target.
+        conn.execute(
+            "UPDATE representatives SET current_focus_customer_id = NULL "
+            "WHERE current_focus_customer_id = ?",
+            (customer_id,),
         )
 
 
@@ -316,12 +361,44 @@ def get_active_session_by_customer(customer_id: int):
         ).fetchone()
 
 
-def get_active_session_by_rep(rep_id: int):
-    """A rep may have at most one active customer at a time in this design."""
+def get_active_sessions_by_rep(rep_id: int):
+    """A rep can now have several active customers at once."""
     with closing(db_connect()) as conn:
         return conn.execute(
-            "SELECT * FROM sessions WHERE rep_id = ? AND active = 1", (rep_id,)
+            "SELECT * FROM sessions WHERE rep_id = ? AND active = 1 "
+            "ORDER BY started_at",
+            (rep_id,),
+        ).fetchall()
+
+
+def set_rep_focus(rep_id: int, customer_id):
+    with closing(db_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE representatives SET current_focus_customer_id = ? "
+            "WHERE telegram_id = ?",
+            (customer_id, rep_id),
+        )
+
+
+# --- thread map (maps a message sent into the rep's chat back to the   --- #
+# --- customer it came from, so replies route correctly)                --- #
+
+def record_thread_map(rep_id: int, rep_message_id: int, customer_id: int):
+    with closing(db_connect()) as conn, conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO thread_map (rep_id, rep_message_id, customer_id) "
+            "VALUES (?, ?, ?)",
+            (rep_id, rep_message_id, customer_id),
+        )
+
+
+def lookup_thread_customer(rep_id: int, rep_message_id: int):
+    with closing(db_connect()) as conn:
+        row = conn.execute(
+            "SELECT customer_id FROM thread_map WHERE rep_id = ? AND rep_message_id = ?",
+            (rep_id, rep_message_id),
         ).fetchone()
+        return row["customer_id"] if row else None
 
 
 # --- media log -------------------------------------------------------------
@@ -427,6 +504,63 @@ async def list_reps_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------- #
+# Multi-chat routing for representatives
+# --------------------------------------------------------------------------- #
+
+async def resolve_target_customer_for_rep(update: Update, context: ContextTypes.DEFAULT_TYPE, rep_id: int):
+    """
+    Figures out which customer a representative's message/command is meant
+    for, when they may have several active conversations at once.
+
+    Resolution order:
+      1. Only one active conversation -> that's the target, no ambiguity.
+      2. Message is a reply to a previously relayed message -> use the
+         customer that message came from.
+      3. A "focus" customer was set earlier via /switch -> use that.
+      4. Otherwise: list the active conversations and ask the rep to either
+         reply to a specific customer's message or run /switch, then
+         return None (caller should stop - this function already replied).
+
+    Returns the target customer_id, or None if no active sessions exist or
+    the choice is ambiguous (a clarifying message has already been sent).
+    """
+    sessions = get_active_sessions_by_rep(rep_id)
+    if not sessions:
+        await update.message.reply_text(
+            "You don't have any active conversations right now.\n"
+            "Use /newcode to generate one for a customer."
+        )
+        return None
+
+    if len(sessions) == 1:
+        return sessions[0]["customer_id"]
+
+    active_ids = {s["customer_id"] for s in sessions}
+
+    if update.message.reply_to_message:
+        mapped = lookup_thread_customer(rep_id, update.message.reply_to_message.message_id)
+        if mapped is not None and mapped in active_ids:
+            set_rep_focus(rep_id, mapped)
+            return mapped
+
+    rep = get_rep(rep_id)
+    focus = rep["current_focus_customer_id"] if rep else None
+    if focus is not None and focus in active_ids:
+        return focus
+
+    listing = "\n".join(
+        f"• {s['customer_name'] or 'Customer'} — /switch {s['customer_id']}"
+        for s in sessions
+    )
+    await update.message.reply_text(
+        "💬 You have multiple active conversations. Reply directly to the "
+        "customer's message you want to answer, or pick a default:\n\n"
+        f"{listing}"
+    )
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Command handlers
 # --------------------------------------------------------------------------- #
 
@@ -462,15 +596,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rep = get_rep(rep_id)
     rep_name = rep["name"] if rep and rep["name"] else "Representative"
+    customer_name = update.effective_user.full_name or "Customer"
 
-    if get_active_session_by_rep(rep_id):
-        await update.message.reply_text(
-            "⚠️ This representative is currently in another conversation. "
-            "Please ask them for a new code in a moment."
-        )
-        return
-
-    start_session(user_id, rep_id)
+    start_session(user_id, rep_id, customer_name)
 
     await update.message.reply_text(
         f"✅ Connected! You're now chatting with {rep_name}.\n"
@@ -478,10 +606,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "delivered directly.\nSend /end to finish the conversation."
     )
     try:
+        active_count = len(get_active_sessions_by_rep(rep_id))
         await context.bot.send_message(
             chat_id=rep_id,
-            text=f"🔔 A customer has connected using code {code}. You can chat now.\n"
-                 "Send /end to finish the conversation.",
+            text=f"🔔 {customer_name} connected using code {code}. You can chat now.\n"
+                 f"You now have {active_count} active conversation(s). "
+                 "Reply directly to a customer's message to answer them, "
+                 "or use /chats to see everyone.",
         )
     except Exception:
         logger.exception("Could not notify representative %s", rep_id)
@@ -538,13 +669,6 @@ async def new_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if get_active_session_by_rep(rep_id):
-        await update.message.reply_text(
-            "You already have an active conversation. Finish it with /end "
-            "before starting a new one."
-        )
-        return
-
     code = generate_code(rep_id)
     bot_username = context.bot.username
     link = f"https://t.me/{bot_username}?start={code}"
@@ -571,9 +695,12 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.exception("Could not notify rep %s of session end", rep_id)
         return
 
-    session = get_active_session_by_rep(user_id)
-    if session:
-        customer_id = session["customer_id"]
+    rep = get_rep(user_id)
+    if rep:
+        customer_id = await resolve_target_customer_for_rep(update, context, user_id)
+        if customer_id is None:
+            return  # helper already replied (no sessions, or ambiguous)
+
         end_session_for_customer(customer_id)
         await update.message.reply_text("Conversation ended.")
         try:
@@ -588,6 +715,67 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("You don't have an active conversation.")
+
+
+async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rep_id = update.effective_user.id
+    rep = get_rep(rep_id)
+    if rep is None:
+        await update.message.reply_text("Please run /register first.")
+        return
+
+    sessions = get_active_sessions_by_rep(rep_id)
+    if not sessions:
+        await update.message.reply_text(
+            "You have no active conversations right now. Use /newcode to start one."
+        )
+        return
+
+    focus = rep["current_focus_customer_id"]
+    lines = []
+    for s in sessions:
+        marker = "👉 " if s["customer_id"] == focus else "• "
+        name = s["customer_name"] or "Customer"
+        lines.append(f"{marker}{name} — /switch {s['customer_id']}")
+
+    await update.message.reply_text(
+        "Active conversations (👉 = your current default):\n\n"
+        + "\n".join(lines)
+        + "\n\nReply directly to a customer's message to answer them, or "
+          "use /switch <id> to set a default for plain messages."
+    )
+
+
+async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rep_id = update.effective_user.id
+    rep = get_rep(rep_id)
+    if rep is None:
+        await update.message.reply_text("Please run /register first.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Usage: /switch <customer_id> - see /chats for the list and IDs."
+        )
+        return
+
+    customer_id = int(context.args[0])
+    sessions = get_active_sessions_by_rep(rep_id)
+    if not any(s["customer_id"] == customer_id for s in sessions):
+        await update.message.reply_text(
+            "That ID isn't one of your active conversations. Check /chats."
+        )
+        return
+
+    set_rep_focus(rep_id, customer_id)
+    name = next(
+        (s["customer_name"] for s in sessions if s["customer_id"] == customer_id),
+        "that customer",
+    )
+    await update.message.reply_text(
+        f"✅ Switched. Plain messages will now go to {name} until you reply "
+        "to someone else or /switch again."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -673,14 +861,19 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_active_session_by_customer(user_id)
     if session:
         rep_id = session["rep_id"]
+        customer_name = session["customer_name"] or update.effective_user.full_name or "Customer"
         await save_media_if_present(message, context, user_id, rep_id, "customer")
         try:
-            await context.bot.send_message(chat_id=rep_id, text="🙂 Customer")
-            await context.bot.copy_message(
+            label_msg = await context.bot.send_message(chat_id=rep_id, text=f"🙂 {customer_name}")
+            copied = await context.bot.copy_message(
                 chat_id=rep_id,
                 from_chat_id=user_id,
                 message_id=message.message_id,
             )
+            # Remember both message IDs so a reply to either one routes back
+            # to this customer, even if the rep has several chats open.
+            record_thread_map(rep_id, label_msg.message_id, user_id)
+            record_thread_map(rep_id, copied.message_id, user_id)
         except Exception:
             logger.exception("Failed relaying customer->rep message")
             await message.reply_text(
@@ -688,16 +881,16 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Case 2: sender is a representative in an active session -> relay to customer
-    session = get_active_session_by_rep(user_id)
-    if session:
-        rep = get_rep(user_id)
-        customer_id = session["customer_id"]
-        rep_name = rep["name"] if rep and rep["name"] else "Representative"
+    # Case 2: sender is a registered representative who has set their name
+    # -> figure out which customer they're replying to and relay to them.
+    rep = get_rep(user_id)
+    if rep and not rep["pending_name_setup"]:
+        customer_id = await resolve_target_customer_for_rep(update, context, user_id)
+        if customer_id is None:
+            return  # resolve_target_customer_for_rep already replied
 
-        await save_media_if_present(
-            message, context, customer_id, user_id, "representative"
-        )
+        rep_name = rep["name"] or "Representative"
+        await save_media_if_present(message, context, customer_id, user_id, "representative")
         try:
             await context.bot.send_message(chat_id=customer_id, text=f"👤 {rep_name}")
             await context.bot.copy_message(
@@ -713,7 +906,6 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Case 3: representative is mid name-setup (no active session yet)
-    rep = get_rep(user_id)
     if rep and rep["pending_name_setup"]:
         if message.text:
             new_name = message.text.strip()
@@ -795,6 +987,8 @@ def main():
     application.add_handler(CommandHandler("register", register))
     application.add_handler(CommandHandler("name", name_command))
     application.add_handler(CommandHandler("newcode", new_code))
+    application.add_handler(CommandHandler("chats", chats_command))
+    application.add_handler(CommandHandler("switch", switch_command))
     application.add_handler(CommandHandler("end", end))
     application.add_handler(CommandHandler("approve", approve))
     application.add_handler(CommandHandler("revoke", revoke))
