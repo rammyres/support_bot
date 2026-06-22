@@ -73,7 +73,7 @@ import string
 from contextlib import closing
 from datetime import datetime
 
-from telegram import Update
+from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -105,6 +105,48 @@ logger = logging.getLogger("support_bot")
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+# --------------------------------------------------------------------------- #
+# Bottom command menu (the list shown when tapping the "/" menu button)
+# --------------------------------------------------------------------------- #
+
+DEFAULT_COMMANDS = [
+    BotCommand("start", "Connect with a code, or see instructions"),
+    BotCommand("register", "Register as a representative"),
+    BotCommand("end", "End the current conversation"),
+]
+
+REP_COMMANDS = DEFAULT_COMMANDS + [
+    BotCommand("name", "Change your display name"),
+    BotCommand("newcode", "Generate a one-time customer code"),
+]
+
+ADMIN_COMMANDS = REP_COMMANDS + [
+    BotCommand("approve", "Approve a representative"),
+    BotCommand("revoke", "Revoke a representative"),
+    BotCommand("listreps", "List all representatives"),
+]
+
+
+async def sync_menu_for(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """
+    Sets the bottom command menu for a specific user, based on their role:
+    admin > approved representative > pending representative / customer.
+    Safe to call any time their role changes (register, approve, revoke).
+    """
+    if is_admin(user_id):
+        commands = ADMIN_COMMANDS
+    else:
+        rep = get_rep(user_id)
+        commands = REP_COMMANDS if (rep and rep["approved"]) else DEFAULT_COMMANDS
+
+    try:
+        await context.bot.set_my_commands(
+            commands, scope=BotCommandScopeChat(chat_id=user_id)
+        )
+    except Exception:
+        logger.exception("Could not set command menu for %s", user_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -329,6 +371,7 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     set_rep_approved(target_id, True)
+    await sync_menu_for(context, target_id)
     await update.message.reply_text(f"✅ Approved representative {target_id}.")
     try:
         await context.bot.send_message(
@@ -354,6 +397,7 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     set_rep_approved(target_id, False)
+    await sync_menu_for(context, target_id)
     await update.message.reply_text(f"🚫 Revoked representative access for {target_id}.")
     try:
         await context.bot.send_message(
@@ -446,6 +490,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rep_id = update.effective_user.id
     rep = create_or_get_rep(rep_id)
+    await sync_menu_for(context, rep_id)
 
     if rep["name"]:
         status = "✅ approved" if rep["approved"] else "⏳ pending admin approval"
@@ -673,6 +718,7 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if message.text:
             new_name = message.text.strip()
             set_rep_name(user_id, new_name)
+            await sync_menu_for(context, user_id)
             if rep["approved"]:
                 await message.reply_text(
                     f"✅ Got it, you'll appear as '{new_name}'.\n"
@@ -705,6 +751,30 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Entry point
 # --------------------------------------------------------------------------- #
 
+async def post_init(application: Application):
+    """Runs once on startup: sets the global default menu, then pushes the
+    correct menu to every admin and already-approved representative."""
+    try:
+        await application.bot.set_my_commands(
+            DEFAULT_COMMANDS, scope=BotCommandScopeDefault()
+        )
+    except Exception:
+        logger.exception("Could not set default command menu")
+
+    # Use a lightweight shim so sync_menu_for's `context.bot` access works
+    # even though we only have `application` at startup time.
+    class _BotOnly:
+        def __init__(self, bot):
+            self.bot = bot
+
+    ctx = _BotOnly(application.bot)
+    for admin_id in ADMIN_IDS:
+        await sync_menu_for(ctx, admin_id)
+    for rep in list_reps():
+        if rep["approved"]:
+            await sync_menu_for(ctx, rep["telegram_id"])
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit(
@@ -719,7 +789,7 @@ def main():
 
     init_db()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("register", register))
