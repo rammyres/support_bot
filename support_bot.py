@@ -17,8 +17,8 @@ WHAT THIS BOT DOES
   routes replies automatically: just reply (Telegram's native reply
   feature) to a specific customer's message to answer them. If a rep has
   only one active conversation, plain messages go straight through with no
-  reply needed. /chats lists active conversations; /switch <id> sets which
-  one plain (non-reply) messages go to by default.
+  reply needed. /chats lists active conversations with numbered slots;
+  /switch <number> sets which one plain (non-reply) messages go to.
 - While the session is active, ANY message either side sends (text, photo,
   video, voice note, audio file, document, video note, sticker) is relayed
   to the other side automatically.
@@ -514,15 +514,14 @@ async def resolve_target_customer_for_rep(update: Update, context: ContextTypes.
 
     Resolution order:
       1. Only one active conversation -> that's the target, no ambiguity.
-      2. Message is a reply to a previously relayed message -> use the
-         customer that message came from.
+      2. Message is a Telegram reply to a previously relayed message -> use
+         the customer that message came from, update focus, confirm source.
       3. A "focus" customer was set earlier via /switch -> use that.
-      4. Otherwise: list the active conversations and ask the rep to either
-         reply to a specific customer's message or run /switch, then
-         return None (caller should stop - this function already replied).
+      4. Otherwise: show a numbered list and ask the rep to either reply to
+         a message or use /switch <number>, then return (None, None).
 
-    Returns the target customer_id, or None if no active sessions exist or
-    the choice is ambiguous (a clarifying message has already been sent).
+    Returns (customer_id, customer_name) or (None, None) if no sessions
+    exist or the choice is ambiguous (a clarifying message has been sent).
     """
     sessions = get_active_sessions_by_rep(rep_id)
     if not sessions:
@@ -530,34 +529,37 @@ async def resolve_target_customer_for_rep(update: Update, context: ContextTypes.
             "You don't have any active conversations right now.\n"
             "Use /newcode to generate one for a customer."
         )
-        return None
+        return None, None
 
     if len(sessions) == 1:
-        return sessions[0]["customer_id"]
+        s = sessions[0]
+        return s["customer_id"], s["customer_name"] or "Customer"
 
-    active_ids = {s["customer_id"] for s in sessions}
+    active_ids = {s["customer_id"]: (s["customer_name"] or "Customer") for s in sessions}
 
     if update.message.reply_to_message:
         mapped = lookup_thread_customer(rep_id, update.message.reply_to_message.message_id)
         if mapped is not None and mapped in active_ids:
             set_rep_focus(rep_id, mapped)
-            return mapped
+            return mapped, active_ids[mapped]
 
     rep = get_rep(rep_id)
     focus = rep["current_focus_customer_id"] if rep else None
     if focus is not None and focus in active_ids:
-        return focus
+        return focus, active_ids[focus]
 
-    listing = "\n".join(
-        f"• {s['customer_name'] or 'Customer'} — /switch {s['customer_id']}"
-        for s in sessions
-    )
+    # Ambiguous — show a numbered list so the rep can use /switch 1, /switch 2, etc.
+    lines = []
+    for i, s in enumerate(sessions, 1):
+        lines.append(f"  #{i} — {s['customer_name'] or 'Customer'}")
     await update.message.reply_text(
-        "💬 You have multiple active conversations. Reply directly to the "
-        "customer's message you want to answer, or pick a default:\n\n"
-        f"{listing}"
+        "💬 You have multiple active conversations and no default is set.\n\n"
+        + "\n".join(lines)
+        + "\n\n"
+        "To answer someone: long-press their message and tap Reply.\n"
+        "To set a default: /switch 1, /switch 2, etc. (numbers from /chats)."
     )
-    return None
+    return None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -599,6 +601,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     customer_name = update.effective_user.full_name or "Customer"
 
     start_session(user_id, rep_id, customer_name)
+    set_rep_focus(rep_id, user_id)  # new arrival becomes the default immediately
 
     await update.message.reply_text(
         f"✅ Connected! You're now chatting with {rep_name}.\n"
@@ -606,14 +609,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "delivered directly.\nSend /end to finish the conversation."
     )
     try:
-        active_count = len(get_active_sessions_by_rep(rep_id))
-        await context.bot.send_message(
-            chat_id=rep_id,
-            text=f"🔔 {customer_name} connected using code {code}. You can chat now.\n"
-                 f"You now have {active_count} active conversation(s). "
-                 "Reply directly to a customer's message to answer them, "
-                 "or use /chats to see everyone.",
-        )
+        sessions = get_active_sessions_by_rep(rep_id)
+        active_count = len(sessions)
+        others = [s["customer_name"] or "Customer" for s in sessions if s["customer_id"] != user_id]
+
+        if active_count == 1:
+            note = f"🔔 {customer_name} just connected. You can start chatting now.\n\nSend /end to close this conversation."
+        else:
+            others_str = ", ".join(others) if others else "—"
+            note = (
+                f"🔔 {customer_name} just connected and is now your active conversation.\n\n"
+                f"You also have {len(others)} other open chat(s): {others_str}\n\n"
+                "Your messages will go to them by default.\n"
+                "To reply to someone else: long-press their message → Reply.\n"
+                "To switch default: /chats and then /switch <number>."
+            )
+        await context.bot.send_message(chat_id=rep_id, text=note)
     except Exception:
         logger.exception("Could not notify representative %s", rep_id)
 
@@ -685,11 +696,20 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_active_session_by_customer(user_id)
     if session:
         rep_id = session["rep_id"]
+        customer_name = session["customer_name"] or "Customer"
         end_session_for_customer(user_id)
         await update.message.reply_text("Conversation ended. Take care!")
         try:
+            remaining = get_active_sessions_by_rep(rep_id)
+            if remaining:
+                next_name = remaining[0]["customer_name"] or "Customer"
+                set_rep_focus(rep_id, remaining[0]["customer_id"])
+                tail = f"\n\nYou still have {len(remaining)} open conversation(s). Default is now: {next_name}."
+            else:
+                tail = "\n\nYou have no more active conversations."
             await context.bot.send_message(
-                chat_id=rep_id, text="ℹ️ The customer has ended the conversation."
+                chat_id=rep_id,
+                text=f"ℹ️ {customer_name} ended the conversation.{tail}"
             )
         except Exception:
             logger.exception("Could not notify rep %s of session end", rep_id)
@@ -697,21 +717,28 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rep = get_rep(user_id)
     if rep:
-        customer_id = await resolve_target_customer_for_rep(update, context, user_id)
+        customer_id, customer_name = await resolve_target_customer_for_rep(update, context, user_id)
         if customer_id is None:
-            return  # helper already replied (no sessions, or ambiguous)
+            return
 
         end_session_for_customer(customer_id)
-        await update.message.reply_text("Conversation ended.")
+
+        remaining = get_active_sessions_by_rep(user_id)
+        if remaining:
+            next_name = remaining[0]["customer_name"] or "Customer"
+            set_rep_focus(user_id, remaining[0]["customer_id"])
+            tail = f"\nDefault is now: {next_name}."
+        else:
+            tail = "\nNo more active conversations."
+        await update.message.reply_text(f"Conversation with {customer_name} ended.{tail}")
+
         try:
             await context.bot.send_message(
                 chat_id=customer_id,
                 text="ℹ️ The representative has ended the conversation.",
             )
         except Exception:
-            logger.exception(
-                "Could not notify customer %s of session end", customer_id
-            )
+            logger.exception("Could not notify customer %s of session end", customer_id)
         return
 
     await update.message.reply_text("You don't have an active conversation.")
@@ -733,17 +760,19 @@ async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     focus = rep["current_focus_customer_id"]
     lines = []
-    for s in sessions:
-        marker = "👉 " if s["customer_id"] == focus else "• "
+    for i, s in enumerate(sessions, 1):
         name = s["customer_name"] or "Customer"
-        lines.append(f"{marker}{name} — /switch {s['customer_id']}")
+        is_focus = s["customer_id"] == focus
+        marker = "👉" if is_focus else f"#{i}"
+        label = " (active default)" if is_focus else ""
+        lines.append(f"{marker} {name}{label}  →  /switch {i}")
 
-    await update.message.reply_text(
-        "Active conversations (👉 = your current default):\n\n"
-        + "\n".join(lines)
-        + "\n\nReply directly to a customer's message to answer them, or "
-          "use /switch <id> to set a default for plain messages."
+    header = f"💬 You have {len(sessions)} active conversation(s):\n"
+    footer = (
+        "\n\nTo reply to someone: long-press their message → Reply.\n"
+        "To change default: /switch <number>"
     )
+    await update.message.reply_text(header + "\n".join(lines) + footer)
 
 
 async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -753,28 +782,33 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please run /register first.")
         return
 
+    sessions = get_active_sessions_by_rep(rep_id)
+    if not sessions:
+        await update.message.reply_text(
+            "You have no active conversations right now. Use /newcode to start one."
+        )
+        return
+
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text(
-            "Usage: /switch <customer_id> - see /chats for the list and IDs."
+            "Usage: /switch <number>  — use /chats to see the numbered list."
         )
         return
 
-    customer_id = int(context.args[0])
-    sessions = get_active_sessions_by_rep(rep_id)
-    if not any(s["customer_id"] == customer_id for s in sessions):
+    slot = int(context.args[0])
+    if slot < 1 or slot > len(sessions):
         await update.message.reply_text(
-            "That ID isn't one of your active conversations. Check /chats."
+            f"There's no #{slot} in your list. You have {len(sessions)} active conversation(s).\n"
+            "Use /chats to see the current numbers."
         )
         return
 
-    set_rep_focus(rep_id, customer_id)
-    name = next(
-        (s["customer_name"] for s in sessions if s["customer_id"] == customer_id),
-        "that customer",
-    )
+    chosen = sessions[slot - 1]
+    set_rep_focus(rep_id, chosen["customer_id"])
+    name = chosen["customer_name"] or "Customer"
     await update.message.reply_text(
-        f"✅ Switched. Plain messages will now go to {name} until you reply "
-        "to someone else or /switch again."
+        f"✅ Switched to #{slot} — {name}.\n"
+        "Your plain messages will go to them until you reply to someone else or /switch again."
     )
 
 
@@ -885,9 +919,14 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -> figure out which customer they're replying to and relay to them.
     rep = get_rep(user_id)
     if rep and not rep["pending_name_setup"]:
-        customer_id = await resolve_target_customer_for_rep(update, context, user_id)
+        # Capture the focus state before resolution so we can detect if
+        # a reply silently switched it.
+        rep_before = get_rep(user_id)
+        focus_before = rep_before["current_focus_customer_id"] if rep_before else None
+
+        customer_id, customer_name = await resolve_target_customer_for_rep(update, context, user_id)
         if customer_id is None:
-            return  # resolve_target_customer_for_rep already replied
+            return
 
         rep_name = rep["name"] or "Representative"
         await save_media_if_present(message, context, customer_id, user_id, "representative")
@@ -898,6 +937,14 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 from_chat_id=user_id,
                 message_id=message.message_id,
             )
+            # Confirm delivery. If the rep's reply silently switched focus,
+            # mention the switch so they're never left wondering.
+            focus_after = get_rep(user_id)["current_focus_customer_id"]
+            if focus_before != focus_after and focus_before is not None:
+                confirm = f"↩️ Reply sent to {customer_name}. (Default switched to them.)"
+            else:
+                confirm = f"✉️ Sent to {customer_name}."
+            await update.message.reply_text(confirm)
         except Exception:
             logger.exception("Failed relaying rep->customer message")
             await message.reply_text(
