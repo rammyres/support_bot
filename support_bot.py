@@ -79,9 +79,17 @@ import string
 from contextlib import closing
 from datetime import datetime
 
-from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -179,6 +187,7 @@ def init_db():
                 pending_name_setup INTEGER DEFAULT 1,
                 approved INTEGER DEFAULT 0,
                 current_focus_customer_id INTEGER,
+                status_message_id INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -248,6 +257,10 @@ def init_db():
             conn.execute(
                 "ALTER TABLE representatives ADD COLUMN current_focus_customer_id INTEGER"
             )
+        if "status_message_id" not in existing_rep_cols:
+            conn.execute(
+                "ALTER TABLE representatives ADD COLUMN status_message_id INTEGER"
+            )
 
 
 # --- representatives -------------------------------------------------------
@@ -287,6 +300,14 @@ def set_rep_approved(rep_id: int, approved: bool):
         conn.execute(
             "UPDATE representatives SET approved = ? WHERE telegram_id = ?",
             (1 if approved else 0, rep_id),
+        )
+
+
+def set_rep_status_message(rep_id: int, message_id: int):
+    with closing(db_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE representatives SET status_message_id = ? WHERE telegram_id = ?",
+            (message_id, rep_id),
         )
 
 
@@ -411,6 +432,111 @@ def log_media(customer_id, rep_id, sender_role, media_type, file_id, local_path,
             "local_path, caption) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (customer_id, rep_id, sender_role, media_type, file_id, local_path, caption),
         )
+
+
+# --------------------------------------------------------------------------- #
+# Representative status panel (persistent, editable message with buttons)
+# --------------------------------------------------------------------------- #
+
+def _rep_panel_content(rep_id: int):
+    """
+    Build the text and InlineKeyboardMarkup for the representative's status
+    panel. Returns (text, markup). Called both when creating the panel for
+    the first time and whenever it needs to be refreshed.
+    """
+    sessions = get_active_sessions_by_rep(rep_id)
+    rep = get_rep(rep_id)
+    focus = rep["current_focus_customer_id"] if rep else None
+
+    if not sessions:
+        text = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💤  No active conversations\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 New code", callback_data="new_code")],
+        ])
+        return text, markup
+
+    lines = ["━━━━━━━━━━━━━━━━━━━━━━"]
+    focus_name = None
+    focus_customer_id = None
+    for i, s in enumerate(sessions, 1):
+        name = s["customer_name"] or "Customer"
+        if s["customer_id"] == focus:
+            lines.append(f"👉 #{i}  {name}   ← talking to")
+            focus_name = name
+            focus_customer_id = s["customer_id"]
+        else:
+            lines.append(f"      #{i}  {name}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    text = "\n".join(lines)
+
+    buttons = []
+
+    # One button per non-default conversation so the rep can switch with one tap
+    switch_row = []
+    for i, s in enumerate(sessions, 1):
+        if s["customer_id"] != focus:
+            name = s["customer_name"] or "Customer"
+            switch_row.append(
+                InlineKeyboardButton(
+                    f"↔️ Talk to #{i} {name}",
+                    callback_data=f"set_focus:{s['customer_id']}",
+                )
+            )
+    # Split into rows of 2 so buttons don't overflow on mobile
+    for i in range(0, len(switch_row), 2):
+        buttons.append(switch_row[i:i + 2])
+
+    # Action row
+    action_row = [InlineKeyboardButton("🔑 New code", callback_data="new_code")]
+    if focus_customer_id:
+        action_row.append(
+            InlineKeyboardButton(
+                f"🔚 End with {focus_name}",
+                callback_data=f"end_chat:{focus_customer_id}",
+            )
+        )
+    buttons.append(action_row)
+
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def upsert_rep_panel(context, rep_id: int):
+    """
+    Send the status panel to the rep if they don't have one yet, or edit
+    the existing panel message in place. Falls back to sending a fresh
+    message if the old one can no longer be edited (too old, or deleted).
+    """
+    rep = get_rep(rep_id)
+    if rep is None:
+        return
+
+    text, markup = _rep_panel_content(rep_id)
+    msg_id = rep["status_message_id"]
+
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=rep_id,
+                message_id=msg_id,
+                text=text,
+                reply_markup=markup,
+            )
+            return
+        except Exception:
+            # Message too old, deleted, or content unchanged — send a new one
+            pass
+
+    try:
+        msg = await context.bot.send_message(
+            chat_id=rep_id, text=text, reply_markup=markup
+        )
+        set_rep_status_message(rep_id, msg.message_id)
+    except Exception:
+        logger.exception("Could not send status panel for rep %s", rep_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -603,10 +729,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_session(user_id, rep_id, customer_name)
     set_rep_focus(rep_id, user_id)  # new arrival becomes the default immediately
 
+    customer_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔚 End conversation", callback_data="end_self")]
+    ])
     await update.message.reply_text(
         f"✅ Connected! You're now chatting with {rep_name}.\n"
         "Send text, photos, videos, voice messages, or files - they'll be "
-        "delivered directly.\nSend /end to finish the conversation."
+        "delivered directly.\nTap the button below or send /end to finish.",
+        reply_markup=customer_markup,
     )
     try:
         sessions = get_active_sessions_by_rep(rep_id)
@@ -614,17 +744,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         others = [s["customer_name"] or "Customer" for s in sessions if s["customer_id"] != user_id]
 
         if active_count == 1:
-            note = f"🔔 {customer_name} just connected. You can start chatting now.\n\nSend /end to close this conversation."
+            note = f"🔔 {customer_name} just connected. You can start chatting now."
         else:
             others_str = ", ".join(others) if others else "—"
             note = (
                 f"🔔 {customer_name} just connected and is now your active conversation.\n\n"
-                f"You also have {len(others)} other open chat(s): {others_str}\n\n"
-                "Your messages will go to them by default.\n"
-                "To reply to someone else: long-press their message → Reply.\n"
-                "To switch default: /chats and then /switch <number>."
+                f"Other open chats: {others_str}"
             )
         await context.bot.send_message(chat_id=rep_id, text=note)
+        await upsert_rep_panel(context, rep_id)
     except Exception:
         logger.exception("Could not notify representative %s", rep_id)
 
@@ -711,6 +839,7 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=rep_id,
                 text=f"ℹ️ {customer_name} ended the conversation.{tail}"
             )
+            await upsert_rep_panel(context, rep_id)
         except Exception:
             logger.exception("Could not notify rep %s of session end", rep_id)
         return
@@ -731,6 +860,7 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             tail = "\nNo more active conversations."
         await update.message.reply_text(f"Conversation with {customer_name} ended.{tail}")
+        await upsert_rep_panel(context, user_id)
 
         try:
             await context.bot.send_message(
@@ -810,6 +940,7 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Switched to #{slot} — {name}.\n"
         "Your plain messages will go to them until you reply to someone else or /switch again."
     )
+    await upsert_rep_panel(context, rep_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -898,14 +1029,38 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         customer_name = session["customer_name"] or update.effective_user.full_name or "Customer"
         await save_media_if_present(message, context, user_id, rep_id, "customer")
         try:
-            label_msg = await context.bot.send_message(chat_id=rep_id, text=f"🙂 {customer_name}")
+            # Build label buttons. Always show End; show Set-as-default only
+            # when this customer isn't already the rep's current focus.
+            rep_state = get_rep(rep_id)
+            label_buttons = [[
+                InlineKeyboardButton(
+                    "🔚 End chat", callback_data=f"end_chat:{user_id}"
+                )
+            ]]
+            sessions_for_rep = get_active_sessions_by_rep(rep_id)
+            if (
+                len(sessions_for_rep) > 1
+                and rep_state
+                and rep_state["current_focus_customer_id"] != user_id
+            ):
+                label_buttons[0].insert(
+                    0,
+                    InlineKeyboardButton(
+                        "👉 Talk to them", callback_data=f"set_focus:{user_id}"
+                    ),
+                )
+            label_markup = InlineKeyboardMarkup(label_buttons)
+
+            label_msg = await context.bot.send_message(
+                chat_id=rep_id,
+                text=f"🙂 {customer_name}",
+                reply_markup=label_markup,
+            )
             copied = await context.bot.copy_message(
                 chat_id=rep_id,
                 from_chat_id=user_id,
                 message_id=message.message_id,
             )
-            # Remember both message IDs so a reply to either one routes back
-            # to this customer, even if the rep has several chats open.
             record_thread_map(rep_id, label_msg.message_id, user_id)
             record_thread_map(rep_id, copied.message_id, user_id)
         except Exception:
@@ -919,10 +1074,7 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # -> figure out which customer they're replying to and relay to them.
     rep = get_rep(user_id)
     if rep and not rep["pending_name_setup"]:
-        # Capture the focus state before resolution so we can detect if
-        # a reply silently switched it.
-        rep_before = get_rep(user_id)
-        focus_before = rep_before["current_focus_customer_id"] if rep_before else None
+        focus_before = rep["current_focus_customer_id"]
 
         customer_id, customer_name = await resolve_target_customer_for_rep(update, context, user_id)
         if customer_id is None:
@@ -937,14 +1089,15 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 from_chat_id=user_id,
                 message_id=message.message_id,
             )
-            # Confirm delivery. If the rep's reply silently switched focus,
-            # mention the switch so they're never left wondering.
             focus_after = get_rep(user_id)["current_focus_customer_id"]
             if focus_before != focus_after and focus_before is not None:
                 confirm = f"↩️ Reply sent to {customer_name}. (Default switched to them.)"
             else:
                 confirm = f"✉️ Sent to {customer_name}."
             await update.message.reply_text(confirm)
+            # Refresh the panel if focus changed
+            if focus_before != focus_after:
+                await upsert_rep_panel(context, user_id)
         except Exception:
             logger.exception("Failed relaying rep->customer message")
             await message.reply_text(
@@ -984,6 +1137,98 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "You don't have an active conversation right now.\n"
         "Customers: use /start <code>. Representatives: use /register."
     )
+
+
+# --------------------------------------------------------------------------- #
+# Button callback handler
+# --------------------------------------------------------------------------- #
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()          # acknowledge immediately to dismiss loading state
+    user_id = update.effective_user.id
+    data = query.data
+
+    # ── new_code ─────────────────────────────────────────────────────────────
+    if data == "new_code":
+        rep = get_rep(user_id)
+        if not rep or rep["pending_name_setup"] or not rep["approved"]:
+            await query.answer("Not available right now.", show_alert=True)
+            return
+        code = generate_code(user_id)
+        bot_username = context.bot.username
+        link = f"https://t.me/{bot_username}?start={code}"
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"🔑 New connection code: {code}\n\n"
+                 f"Send this link to your customer:\n{link}\n\n"
+                 f"Or manual code:\n/start {code}",
+        )
+
+    # ── set_focus:<customer_id> ───────────────────────────────────────────────
+    elif data.startswith("set_focus:"):
+        customer_id = int(data.split(":")[1])
+        sessions = get_active_sessions_by_rep(user_id)
+        session = next((s for s in sessions if s["customer_id"] == customer_id), None)
+        if not session:
+            await query.answer("That conversation is no longer active.", show_alert=True)
+        else:
+            set_rep_focus(user_id, customer_id)
+            name = session["customer_name"] or "Customer"
+            await query.answer(f"Switched to {name}")
+        await upsert_rep_panel(context, user_id)
+
+    # ── end_chat:<customer_id> ────────────────────────────────────────────────
+    elif data.startswith("end_chat:"):
+        customer_id = int(data.split(":")[1])
+        session = get_active_session_by_customer(customer_id)
+        if not session or session["rep_id"] != user_id:
+            await query.answer("That conversation is no longer active.", show_alert=True)
+            await upsert_rep_panel(context, user_id)
+            return
+        name = session["customer_name"] or "Customer"
+        end_session_for_customer(customer_id)
+        remaining = get_active_sessions_by_rep(user_id)
+        if remaining:
+            set_rep_focus(user_id, remaining[0]["customer_id"])
+            next_name = remaining[0]["customer_name"] or "Customer"
+            await query.answer(f"Ended with {name}. Now talking to {next_name}.")
+        else:
+            await query.answer(f"Ended with {name}.")
+        try:
+            await context.bot.send_message(
+                chat_id=customer_id,
+                text="ℹ️ The representative has ended the conversation.",
+            )
+        except Exception:
+            logger.exception("Could not notify customer %s", customer_id)
+        await upsert_rep_panel(context, user_id)
+
+    # ── end_self (customer tapping their own End button) ─────────────────────
+    elif data == "end_self":
+        session = get_active_session_by_customer(user_id)
+        if not session:
+            await query.answer("No active conversation.", show_alert=True)
+            return
+        rep_id = session["rep_id"]
+        customer_name = session["customer_name"] or "Customer"
+        end_session_for_customer(user_id)
+        await context.bot.send_message(chat_id=user_id, text="Conversation ended. Take care!")
+        try:
+            remaining = get_active_sessions_by_rep(rep_id)
+            if remaining:
+                set_rep_focus(rep_id, remaining[0]["customer_id"])
+                next_name = remaining[0]["customer_name"] or "Customer"
+                tail = f"\n\nDefault is now: {next_name}."
+            else:
+                tail = "\n\nNo more active conversations."
+            await context.bot.send_message(
+                chat_id=rep_id,
+                text=f"ℹ️ {customer_name} ended the conversation.{tail}",
+            )
+            await upsert_rep_panel(context, rep_id)
+        except Exception:
+            logger.exception("Could not notify rep %s", rep_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1040,6 +1285,7 @@ def main():
     application.add_handler(CommandHandler("approve", approve))
     application.add_handler(CommandHandler("revoke", revoke))
     application.add_handler(CommandHandler("listreps", list_reps_command))
+    application.add_handler(CallbackQueryHandler(handle_button))
 
     # Catch-all for everything else (text, photo, video, audio, voice,
     # document, video_note, sticker, ...) that isn't a command.
